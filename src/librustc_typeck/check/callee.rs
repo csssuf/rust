@@ -15,6 +15,7 @@ use super::method::MethodCallee;
 use hir::def::Def;
 use hir::def_id::{DefId, LOCAL_CRATE};
 use rustc::{infer, traits};
+use rustc::infer::type_variable::TypeVariableOrigin;
 use rustc::ty::{self, TyCtxt, TypeFoldable, LvaluePreference, Ty};
 use rustc::ty::adjustment::{Adjustment, Adjust, AutoBorrow};
 use syntax::abi;
@@ -54,7 +55,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         let mut autoderef = self.autoderef(callee_expr.span, expr_ty);
         let mut result = None;
         while result.is_none() && autoderef.next().is_some() {
-            result = self.try_overloaded_call_step(call_expr, callee_expr, &autoderef);
+            result = self.try_overloaded_call_step(call_expr, callee_expr, arg_exprs, &autoderef);
         }
         autoderef.finalize();
 
@@ -86,6 +87,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     fn try_overloaded_call_step(&self,
                                 call_expr: &'gcx hir::Expr,
                                 callee_expr: &'gcx hir::Expr,
+                                arg_exprs: &'gcx [hir::Expr],
                                 autoderef: &Autoderef<'a, 'gcx, 'tcx>)
                                 -> Option<CallStep<'tcx>> {
         let adjusted_ty = autoderef.unambiguous_final_ty();
@@ -117,6 +119,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                     self.record_deferred_call_resolution(def_id, DeferredCallResolution {
                         call_expr,
                         callee_expr,
+                        arg_exprs,
                         adjusted_ty,
                         adjustments,
                         fn_sig,
@@ -142,7 +145,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             _ => {}
         }
 
-        self.try_overloaded_call_traits(call_expr, adjusted_ty).map(|(autoref, method)| {
+        self.try_overloaded_call_traits(call_expr, arg_exprs, adjusted_ty).map(|(autoref, method)| {
             let mut adjustments = autoderef.adjust_steps(LvaluePreference::NoPreference);
             adjustments.extend(autoref);
             self.apply_adjustments(callee_expr, adjustments);
@@ -152,6 +155,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 
     fn try_overloaded_call_traits(&self,
                                   call_expr: &hir::Expr,
+                                  arg_exprs: &[hir::Expr],
                                   adjusted_ty: Ty<'tcx>)
                                   -> Option<(Option<Adjustment<'tcx>>,
                                              MethodCallee<'tcx>)> {
@@ -165,11 +169,18 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 None => continue,
             };
 
+            let arg_exprs_tup = self.tcx.mk_tup(
+                arg_exprs
+                    .iter()
+                    .map(|_| self.next_ty_var(TypeVariableOrigin::TypeInference(call_expr.span))),
+                false
+            );
+
             match self.lookup_method_in_trait(call_expr.span,
                                               method_name,
                                               trait_def_id,
                                               adjusted_ty,
-                                              None) {
+                                              Some(&[arg_exprs_tup])) {
                 None => continue,
                 Some(ok) => {
                     let method = self.register_infer_ok_obligations(ok);
@@ -346,6 +357,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 pub struct DeferredCallResolution<'gcx: 'tcx, 'tcx> {
     call_expr: &'gcx hir::Expr,
     callee_expr: &'gcx hir::Expr,
+    arg_exprs: &'gcx [hir::Expr],
     adjusted_ty: Ty<'tcx>,
     adjustments: Vec<Adjustment<'tcx>>,
     fn_sig: ty::FnSig<'tcx>,
@@ -363,6 +375,7 @@ impl<'a, 'gcx, 'tcx> DeferredCallResolution<'gcx, 'tcx> {
 
         // We may now know enough to figure out fn vs fnmut etc.
         match fcx.try_overloaded_call_traits(self.call_expr,
+                                             self.arg_exprs,
                                              self.adjusted_ty) {
             Some((autoref, method_callee)) => {
                 // One problem is that when we get here, we are going
